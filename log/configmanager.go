@@ -5,9 +5,16 @@ import (
 	"fmt"
 	"github.com/opencord/voltha-lib-go/v2/pkg/db/kvstore"
 	"github.com/opencord/voltha-lib-go/v2/pkg/db/model"
-	"time"
+	//	"github.com/opencord/voltha-lib-go/v2/pkg/log"
 )
 
+/*func init() {
+	_, err := log.AddPackage(log.JSON, log.DebugLevel, nil)
+	if err != nil {
+		log.Errorw("unable-to-register-package-to-the-log-map", log.Fields{"error": err})
+	}
+}
+*/
 const (
 	defaultkvStoreConfigPath = "config"
 )
@@ -44,7 +51,7 @@ type ConfigManager struct {
 	backend *model.Backend
 }
 
-//create new ConfigManager
+//Create New ConfigManager
 func NewConfigManager(kvClient kvstore.Client, kvStoreType, kvStoreHost, kvStoreDataPrefix string, kvStorePort, kvStoreTimeout int) *ConfigManager {
 	// Setup the KV store
 	var cm ConfigManager
@@ -58,7 +65,7 @@ func NewConfigManager(kvClient kvstore.Client, kvStoreType, kvStoreHost, kvStore
 	return &cm
 }
 
-//populateLogLevel populate the data got from retrive to loglevel 
+//populateLogLevel store the loglevel retrieved from kvstore to LogLevel
 func populateLogLevel(data map[string]interface{}) []LogLevel {
 	loglevel := []LogLevel{}
 	for _, v := range data {
@@ -71,34 +78,19 @@ func populateLogLevel(data map[string]interface{}) []LogLevel {
 	return loglevel
 }
 
-//InitComponentConfig initialize componentconfig for component class,component name and pod name
-func InitComponentConfig(componentLabel string, configType ConfigType, createIfNotPresent bool, cm *ConfigManager) (*ComponentConfig, error) {
+//Initialize the component config
+func InitComponentConfig(componentLabel string, configType ConfigType, cm *ConfigManager) (*ComponentConfig, error) {
 	//construct ComponentConfig
 	//verify componentConfig for provided componentLabel and configType is present in etcd,
+
 	cConfig := &ComponentConfig{
 		componentLabel:   componentLabel,
 		configType:       configType,
 		CManager:         cm,
-		monitorEnabled:   createIfNotPresent,
 		changeEventChan:  nil,
 		kvStoreEventChan: nil,
 		logLevel:         nil,
 	}
-
-	//check the pod is present already in etcd or not
-	if !cConfig.monitorEnabled {
-		data, err := cConfig.Retreive()
-		if err != nil {
-			log.Error("error", err)
-			return cConfig, err
-		}
-
-		if data != nil {
-			loglevel := populateLogLevel(data)
-			cConfig.logLevel = loglevel
-		}
-	}
-
 
 	return cConfig, nil
 }
@@ -107,7 +99,6 @@ type ComponentConfig struct {
 	CManager         *ConfigManager
 	componentLabel   string
 	configType       ConfigType
-	monitorEnabled   bool
 	changeEventChan  chan *ConfigChangeEvent
 	kvStoreEventChan chan *kvstore.Event
 	logLevel         []LogLevel
@@ -118,69 +109,46 @@ type LogLevel struct {
 	Level       string
 }
 
+//MonitorForConfigChange watch on the keys
+//If any changes happen then process the event create new ConfigChangeEvent and return
 func (c *ComponentConfig) MonitorForConfigChange() (chan *ConfigChangeEvent, error) {
-	//componentLabel is e.g adapter,open-olt-adapter
-	//confiType is e.g. loglevel
-
-	//
 	//call makeConfigPath function to create path
 	key := c.makeConfigPath()
 
 	//call backend createwatch method
-	if c.kvStoreEventChan == nil {
-		c.kvStoreEventChan = make(chan *kvstore.Event)
+	c.kvStoreEventChan = make(chan *kvstore.Event)
+	c.changeEventChan = make(chan *ConfigChangeEvent)
 
-		c.kvStoreEventChan = c.CManager.backend.CreateWatch(key)
+	c.kvStoreEventChan = c.CManager.backend.CreateWatch(key)
 
-	}
-
-	//call this method as goroutine "processKVStoreWatchEvents"
-//	go c.testChange()
 	go c.processKVStoreWatchEvents(key)
 
 	return c.changeEventChan, nil
 }
 
+//processKVStoreWatchEvents process the kvStoreEventChan and create ConfigChangeEvent
 func (c *ComponentConfig) processKVStoreWatchEvents(key string) {
 	//In a loop process incoming kvstore events and push changes to changeEventChan
 
 	//call defer backend delete watch method
-	//	defer c.CManager.backend.DeleteWatch(key, c.kvStoreEventChan)
-	if c.changeEventChan == nil {
-		c.changeEventChan = make(chan *ConfigChangeEvent)
-	}
 
 	for watchResp := range c.kvStoreEventChan {
 		configEvent := newChangeEvent(watchResp.EventType, watchResp.Key, watchResp.Value)
-		//c.changeEventChan <- configEvent
+		c.changeEventChan <- configEvent
 	}
 }
-/*
-func (c *ComponentConfig) testChange() {
-	for {
-		time.Sleep(60 * time.Second)
-		loglevel := LogLevel{}
-
-		//added below 3 lines for testing
-		loglevel.PackageName = "github.com#opencord#voltha-lib-go#v2#pkg#kafka"
-		loglevel.Level = "ERROR"
-
-		err := c.Save(loglevel)
-	}
-
-}*/
 
 // NewEvent creates a new Event object
-func newChangeEvent(EventType int, Key, value interface{}) *ConfigChangeEvent {
+func newChangeEvent(eventType int, key, value interface{}) *ConfigChangeEvent {
+	//var key string
 	evnt := new(ConfigChangeEvent)
-	evnt.ChangeType = EventType
-	evnt.Key = Key.(string)
+	evnt.ChangeType = eventType
+	evnt.Key = fmt.Sprintf("%s", key)
 	evnt.Value = value
 
 	return evnt
 }
 
-//Retreive the data from etcd 
 func (c *ComponentConfig) Retreive() (map[string]interface{}, error) {
 	//retrieve the data for componentLabel,configType and configKey
 	//e.g. componentLabel "adapter",configType "loglevel" and configKey "config"
@@ -207,6 +175,8 @@ func (c *ComponentConfig) Retreive() (map[string]interface{}, error) {
 
 func (c *ComponentConfig) RetreiveAsString() (string, error) {
 	//call  Retrieve method
+	c.CManager.backend.Lock()
+	defer c.CManager.backend.Unlock()
 
 	data, err := c.Retreive()
 	if err != nil {
@@ -217,6 +187,8 @@ func (c *ComponentConfig) RetreiveAsString() (string, error) {
 }
 
 func (c *ComponentConfig) RetreiveAll() (map[string]*kvstore.KVPair, error) {
+	c.CManager.backend.Lock()
+	defer c.CManager.backend.Unlock()
 	key := c.makeConfigPath()
 
 	data, err := c.CManager.backend.List(key)
@@ -226,7 +198,6 @@ func (c *ComponentConfig) RetreiveAll() (map[string]*kvstore.KVPair, error) {
 	return data, nil
 }
 
-//Save saves the data to etcd
 func (c *ComponentConfig) Save(configValue interface{}) error {
 	//construct key using makeConfigPath
 	key := c.makeConfigPath()
@@ -246,6 +217,8 @@ func (c *ComponentConfig) Save(configValue interface{}) error {
 
 func (c *ComponentConfig) Delete(configKey string) error {
 	//construct key using makeConfigPath
+	c.CManager.backend.Lock()
+	defer c.CManager.backend.Unlock()
 	key := c.makeConfigPath()
 
 	//delete the config
@@ -256,11 +229,10 @@ func (c *ComponentConfig) Delete(configKey string) error {
 	return nil
 }
 
-//create etcd path
+//crete key
 func (c *ComponentConfig) makeConfigPath() string {
 	//construct path
 	cType := c.configType.String()
 	configPath := defaultkvStoreConfigPath + "/" + c.componentLabel + "/" + cType
-
 	return configPath
 }
